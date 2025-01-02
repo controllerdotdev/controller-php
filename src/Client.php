@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Controller;
 
 use Controller\Context\EnvironmentContext;
@@ -87,10 +89,35 @@ class Client
         ];
     }
 
+    private function findApplicationFrame(array $trace): ?array
+    {
+        foreach ($trace as $frame) {
+            $file = $frame['file'] ?? '';
+
+            // Ignora apenas arquivos do vendor
+            if (str_contains($file, '/vendor/')) {
+                continue;
+            }
+
+            return $frame;
+        }
+        return null;
+    }
+
+    private function getRelativePath(string $file): string
+    {
+        // Sobe um nível do diretório public para pegar a raiz do projeto
+        $projectDir = dirname(getcwd());
+        $relativePath = str_replace($projectDir . '/', '', $file);
+
+        return $relativePath;
+    }
+
     private function buildReport(\Throwable $throwable): array
     {
-        $trace = $this->getFullTrace($throwable);
         $traceId = $this->generateTraceId();
+        $trace = $throwable->getTrace();
+        $applicationFrame = $this->findApplicationFrame($trace);
 
         return [
             'event_id' => Uuid::uuid4()->toString(),
@@ -102,14 +129,24 @@ class Client
 
             'exception' => [
                 'type' => get_class($throwable),
-                'value' => $throwable->getMessage(),
-                'mechanism' => [
-                    'type' => 'generic',
-                    'handled' => false,
-                ],
-                'stacktrace' => [
-                    'frames' => $trace
-                ],
+                'message' => $throwable->getMessage(),
+                'file' => $this->getRelativePath($applicationFrame['file'] ?? $throwable->getFile()),
+                'line' => $applicationFrame['line'] ?? $throwable->getLine(),
+                'class' => $applicationFrame['class'] ?? null,
+                'function' => $applicationFrame['function'] ?? null,
+                'stack_trace' => array_map(function ($frame) {
+                    $file = $frame['file'] ?? null;
+                    $line = $frame['line'] ?? null;
+
+                    return [
+                        'file' => $file ? $this->getRelativePath($file) : null,
+                        'line' => $line,
+                        'function' => $frame['function'] ?? null,
+                        'class' => $frame['class'] ?? null,
+                        'type' => $frame['type'] ?? null,
+                        'context' => $file && $line ? $this->getCodeContext($file, $line) : null
+                    ];
+                }, $trace)
             ],
 
             'tags' => $this->tags,
@@ -306,6 +343,23 @@ class Client
         ];
     }
 
+    private function getCodeContext(string $file, int $line, int $contextLines = 3): ?array
+    {
+        if (!file_exists($file)) {
+            return null;
+        }
+
+        try {
+            $lines = file($file);
+            $start = max(0, $line - $contextLines - 1);
+            $length = $contextLines * 2 + 1;
+
+            return array_slice($lines, $start, $length);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
     private function getPackages(): array
     {
         $packages = [];
@@ -384,7 +438,6 @@ class Client
 
     private function sendToApi(array $report): void
     {
-
         $this->httpClient->post($this->getApiEndpoint() . '/issues', [
             'headers' => [
                 'Authorization' => "Bearer {$this->apiKey}",
